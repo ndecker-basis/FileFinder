@@ -1,0 +1,282 @@
+﻿/*
+==================================================
+    CSS File for the BBj FileFinder Utility DWC App
+
+    @author ndecker
+    Copyright (c) 2024 Nick Decker
+
+    See the accompanying LICENSE file for license information
+    See the accompaning READMME.MD file for further information about this program
+==================================================
+*/
+
+
+/* Override default DWC CSS custom properties */
+:root {
+    --dwc-color-primary-h: 260;
+    --dwc-color-warning-40: hsl(var(--dwc-color-warning-h), var(--dwc-color-warning-s), 65%);
+    --dwc-color-warning: var(--dwc-color-warning-40);
+    --dwc-window-header-background: var(--dwc-color-gray-15);
+    --dwc-window-header-color: var(--dwc-color-gray-95);
+    --dwc-window-header-font-weight: 700;
+    --dwc-window-minimize-background: var(--dwc-window-header-color);
+    --dwc-window-maximize-background: var(--dwc-window-header-color);
+    --dwc-window-close-background: var(--dwc-window-header-color);
+    --dwc-window-minimize-active-background: var(--app-color-accent);
+    --dwc-window-maximize-active-background: var(--app-color-accent);
+    --dwc-window-close-active-background: var(--app-color-accent);
+    --dwc-window-border-radius: 0;
+    --dwc-font-weight: var(--dwc-font-weight-semibold, 500);
+    --dwc-dialog-max-width: min(500px, 90vw);
+    --dwc-space: var(--dwc-space-s);
+    --dwc-font-family-mono: Menlo, Monaco, "Andale Mono", "PT Mono", "Dank Mono", "Operator Mono", Inconsolata, "Fira Mono", ui-monospace, "SF Mono", Monaco, "Droid Sans Mono", "Source Code Pro", monospace;
+}
+
+dwc-checkbox:not([checked]) {
+    --dwc-checkbox-label-color: var(--dwc-color-gray-40);
+}
+/* Make the FileChooser wider */
+.BBjFileChooserDialogServer {
+    --dwc-dialog-max-width: clamp(500px, 1000px, 90vw);
+}
+
+/* Make the Message Box buttons wider */
+.BBjMsgBox-button {min-width: 7em;}
+
+/* Define app-specific CSS custom properties */
+:root {
+    --app-color-accent: var(--dwc-color-primary);
+    --app-color-accent-light: var(--dwc-color-primary-95);
+    --app-color-accent-dark: var(--dwc-color-primary-30);
+}
+
+
+/* This affects **all** controls, not just BBjControls */
+/* ============================================================ */
+* {
+    box-sizing: border-box;
+}
+
+/* The main top-level window */
+/* ============================================================ */
+.winOuter dwc-window-content {
+    display: grid;
+    grid-template-rows: auto 1fr;
+    gap: calc(var(--dwc-space) * 3);
+    padding: var(--dwc-space-s);
+}
+
+/* The entire top half that configures the runtime behavior */
+fieldset[is="dwc-fieldset-panel"].winConfig {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr 15em;
+    align-items: end;
+    grid-template-rows: auto auto auto auto;
+    padding: calc(var(--dwc-space-s) * 2);
+    gap: calc(var(--dwc-space-s) * 1.5)
+}
+
+/* All the child windows have a base definition using CSS grid for layout.  The classes are concatenated for greater specificity. */
+/* ============================================================ */
+dwc-panel, fieldset[is="dwc-fieldset-panel"] {
+    width: 100%;
+    /* height: 100%; */
+    gap: var(--dwc-space-xl);
+    padding: var(--dwc-space-s);
+    border-color: var(--dwc-color-default-dark);
+    border-radius: var(--dwc-border-radius);
+    display: flex;
+    flex-flow: row nowrap;
+    align-content: stretch;
+    align-items: center;
+    background-color: var(--dwc-surface-3);
+}
+
+
+/* Indivdual child window definitions */
+/* ============================================================ */
+/* A child window that's used as a container for various BBjControls */
+
+/* The Search Options child window */
+fieldset[is="dwc-fieldset-panel"].winSearchOptions {
+    /* grid-column: span 2; */
+    grid-template-columns: repeat(auto-fit, 20em);
+}
+
+fieldset[is="dwc-fieldset-panel"].winResults {
+    display: grid;
+    grid-template-rows: 1fr;
+    grid-template-columns: 1fr;
+}
+
+fieldset legend {
+    font-weight: var(--dwc-font-weight-bold);
+    color: var(--app-color-accent-dark);
+    margin: 0 var(--dwc-space-s);
+}
+
+
+/* Controls in the windows */
+.lstMode, .lstWorkingDir, .lstFileName {
+    grid-column: 1 / 4;
+}
+.lstFileName {
+    grid-column: 1 / 3;
+}
+.edtContents {
+    grid-column: 3 / 5;
+}
+.btnSearch, .btnSelectDirectory {
+    grid-column: 4 / 4;
+}
+.winSearchOptions {
+    grid-column: 1 / 5;
+}
+
+
+/* Grids used to show results */
+/* ============================================================ */
+dwc-grid {
+    width: 100% !important;
+    height: 100% !important;
+}
+dwc-grid table {
+    border-color: transparent !important;
+    border-bottom-color: var(--dwc-color-default, hsl(var(--dwc-color-primary-h), var(--dwc-color-primary-s), 90%)) !important;
+}
+dwc-grid table thead tr th  {
+    padding: 0.2em 0.5em;
+    font-size: var(--dwc-font-size-m);
+
+    /* Custom color scheme */
+    background-color: var(--app-color-accent-dark);
+    color: var(--app-color-accent-light);
+}
+
+
+dwc-grid td {
+    /* Make the grid data less pronounced */
+    font-family: var(--dwc-font-family-mono);
+    font-weight: var(--dwc-font-weight-normal, 400);
+    font-size: var(--dwc-font-size-xs);
+    text-align: right !important;
+}
+
+dwc-grid td:nth-of-type(1),
+dwc-grid td:nth-of-type(2) {
+    text-align: left !important;
+}
+/* Size the grid's columns.  We're using the !important to override the inline style */
+dwc-grid th:nth-of-type(1) {
+    width: 20%;
+}
+dwc-grid th:nth-of-type(2) {
+    width: 60%;
+}
+dwc-grid th:nth-of-type(3) {
+    width: 8%;
+}
+dwc-grid th:nth-of-type(4) {
+    min-width: 20ch;
+}
+
+.BBjListBox::part(item-label) span {
+    background: hsl(0, 100%, 25%);
+    color: white;
+    border: 1px solid hsla(0, 0%, 100%, 0.75);
+    font-weight: bold;
+    padding: 0.4em 1em;
+    border-radius: 0.5em;
+    background: red !important;
+}
+
+
+
+/* Status Bar and Segments */
+/* ============================================================ */
+dwc-status-bar {
+    background: var(--dwc-color-default);
+    border-bottom: 1px solid var(--dwc-color-primary);
+    display: flex;
+    padding: 0;
+    height: 2em !important;
+}
+
+dwc-status-bar-segment {
+    border-width: 1.5px;
+    border-color: var(--dwc-color-default-75);
+    color: var(--dwc-color-default-40);
+    line-height: 1em;
+    height: 100%;
+    white-space: normal;
+    display: inline-flex;
+    justify-content: start;
+    align-items: center;
+    padding: 0.2em;
+}
+
+
+.statusLabel, .statusComplete {
+    white-space: normal;
+    text-align: center;
+    color: var(--dwc-color-gray-35);
+    font-weight: 600;
+    padding-right: 0.5em;
+}
+.statusValue {
+    color: var(--dwc-color-primary);
+    font-weight: var(--dwc-font-weight-bold);
+    font-size: 120%;
+    height: 100%;
+    padding: 0.25em;
+    display: flex;
+    align-items: center;
+    border-radius: 0.2em;
+    background: hsla(265,100%,50%,0.15);
+    text-align: center;
+    white-space: nowrap;
+    border: 1px solid hsl(265, 100%, 50%);
+}
+.statusComplete {
+    color: var(--dwc-color-succcess);
+}
+
+dwc-status-bar-segment:last-of-type {
+    justify-content: center;
+    margin-right: 0;
+    padding-right: 0;
+    border-right-width: 0;
+}
+
+/* The last status bar segment, where we change the colors DURING a search */
+dwc-status-bar.searching dwc-status-bar-segment:last-of-type {
+    background-color: var(--dwc-color-danger);
+    font-weight: var(--dwc-font-weight-semibold);
+}
+dwc-status-bar.searching dwc-status-bar-segment:last-of-type .statusLabel {
+    color: var(--dwc-color-gray-95);
+    font-weight: var(--dwc-font-weight-semibold);
+}
+dwc-status-bar.searching dwc-status-bar-segment:last-of-type .statusValue {
+    background-color: var(--dwc-color-danger);
+    border: none;
+    color: var(--dwc-color-white);
+    font-weight: var(--dwc-font-weight-bold);
+}
+
+/* The last status bar segment, where we change the colors AFTER a search */
+dwc-status-bar.finishedSearching dwc-status-bar-segment:last-of-type {
+    background-color: var(--dwc-color-success-30);
+    color: var(--dwc-color-success-95);
+    font-weight: var(--dwc-font-weight-semibold);
+}
+dwc-status-bar.finishedSearching dwc-status-bar-segment:last-of-type .statusLabel {
+    color: var(--dwc-color-success-95);
+    font-weight: var(--dwc-font-weight-semibold);
+}
+dwc-status-bar.finishedSearching dwc-status-bar-segment:last-of-type .statusValue {
+    background-color: var(--dwc-color-success-30);
+    border: none;
+    color: var(--dwc-color-white);
+    font-weight: var(--dwc-font-weight-bold);
+}

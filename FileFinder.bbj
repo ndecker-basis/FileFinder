@@ -1,0 +1,1513 @@
+rem /**
+rem  * FileFinder.bbj
+rem  * @author ndecker
+rem  * Copyright (c) 2024 Nick Decker
+rem  *
+rem  * See the accompanying LICENSE file for license information
+rem  * See the accompaning READMME.MD file for further information about this program
+rem  *
+rem  *
+rem  * ===== OVERVIEW =====
+rem  * **FileFinder** is a BBj program designed to streamline file searches within the BBjServices filesystem.
+rem  * It efficiently identifies files by adhering to user-provided naming conventions and/or by searching within
+rem  * files for desired text. Users can conduct recursive file system searches and employ regular expressions to
+rem  * locate their desired content within files.
+rem  *
+rem  * The BBj program is designed to run in the BASIS Dynamic Web Client
+rem  * (see https://documentation.basis.cloud/WhitePapers/DWCOverviewHelpPage.pdf), allowing for a responsive user
+rem  * interface that adapts to the user's browser window or screen real estate. It also takes advantage of the
+rem  * BBjWebManager's (https://documentation.basis.cloud/BASISHelp/WebHelp/bui/BBjBuiManager/bbjbuimanager.htm)
+rem  * ability to inject links, CSS, and set the default theme to follow the operating system's light or dark theme
+rem  * setting.
+rem  *
+rem  * The utility can be run in different modes, allowing users to search for files that:
+rem  * * Match a naming convention
+rem  * * Match a naming convention and contain user-defined content
+rem  *
+rem  * File searches may be performed recursively, or can be limited to the initial target directory. Users can
+rem  * optionally chose to ignore case when matching file names and/or file content. However, it's real power comes
+rem  * into play when the user chooses to supply a regular expression that's used to find matches within the contents
+rem  * of each file searched.
+rem  *
+rem  *
+rem  * ===== NOTES =====
+rem  *  - All debug information can be found in the browser's Developer Tools console tab.
+rem  *  - To use the modes that fix the documentation files, you'll need to have the jSoup JAR in your classpath.  This
+rem  *      means that you can either create an SSCP that includes the JAR, or simply add the JAR file to the "bbj_default"
+rem  *      classpath.  If you do the former, you'll have to run this program specifying the custom SSCP on the command line.
+rem  *      That's not an issue normally, but the BDT's [Run DWC Program] doesn't correctly specify the classpath entry that's
+rem  *      defined in the project's BRE (BASIS Runtime Environment).  See https://bugzilla.basis.cloud/show_bug.cgi?id=31509
+rem  *      for further details.  Therefore, it's easiest to  simply download the jSoup JAR file (https://jsoup.org/download)
+rem  *      and add the JAR to BBj's default classpath.
+rem  *
+rem  */
+
+
+rem To add a mode, make the following changes:
+rem     1) Define the mode-specific Description and Display string variables, e.g.
+rem         a) field private BBjString         mode5Description! = xxx
+rem         b) field private BBjString         mode5Display! = " Search Results - Files with Sample Code "
+rem     2) Search for #optMode and add the mode-specific code
+rem         a) Add the mode to the vector for the modes:    #vectUtilityModes!.addItem(#mode5Description!)
+rem     3) Create the appropriate routine to search for the contents and add it to the searchFileForSoughtContent() method
+rem
+rem
+
+
+rem This is a short BBj program that instantiates the fileSearcher custom class, configures it, then runs it.
+seterr REPORT_ERRORS
+declare FileFinder app!
+
+rem Intantiate the class and configure the runtime options
+app! = new FileFinder()
+app!.setDebug(0);           rem Setting this to 1 makes it take SIGNIFICANTLY longer, so only use it if you're literally debugging how the custom class works
+
+rem Run the app
+app!.run()
+release
+
+REPORT_ERRORS:
+    endtrace
+    msg$ = "Error " + str(err) + " on line " + str(tcb(5)) + " of " + PGM(-1, TCB(13)) + $0d0a$ + "Error Message: " + errmes(-1)
+    temp = msgbox(msg$, 16, "Error Information", mode="theme=danger")
+release
+
+
+
+rem /**
+rem  * <code>FileFinder</code> is a BBj Custom Class that scans a given directory for files that match a
+rem  * name/pattern and optionally inspects the matched files for desired content that's expressed as a
+rem  * simple match or regular expression.
+rem  *
+rem  * THROWn Error Codes:
+rem  *      720: Error getting the BBjThinClient when trying to set cookies
+rem  *      725: Error reading or writing a user preference (cookie)
+rem  *
+rem  */
+class public FileFinder
+
+
+    rem ========================================================================================
+    rem Public Developer Configuration Parameters
+    rem ========================================================================================
+    rem /** The debug flag adds console logging for debugging and performance tracking */
+    field public BBjNumber          Debug = 0
+
+
+    rem General field variables
+    field private BBjString         appName! = "FileFinder"
+    field private BBjSysGui         SysGui!
+    field private BBjNumber         SysGuiChannel
+    field private BBjWebManager     webManager!
+
+    rem Data variables
+    field private BBjVector         vectUtilityModes!
+    field private HashMap           hashExampleCodeWithOldCallbacks!
+
+    rem Windows and controls
+    field private BBjTopLevelWindow winOuter!
+    field private BBjChildWindow    winMode!
+    field private BBjChildWindow    winParameters!
+    field private BBjChildWindow    winSearchOptions!
+    field private BBjChildWindow    winConfig!
+    field private BBjChildWindow    winResults!
+    field private BBjChildWindow    winDirectory!
+    field private BBjListButton     lstMode!
+    field private BBjListButton     lstWorkingDir!
+    field private BBjEditBox        edtWorkingDir!
+    field private BBjListEdit       lstFileName!
+    field private BBjEditBox        edtContents!
+    field private BBjCheckBox       chkIgnoreCaseFilenames!
+    field private BBjCheckBox       chkIgnoreCaseContents!
+    field private BBjCheckBox       chkRegEx!
+    field private BBjCheckBox       chkRecursive!
+    field private BBjButton         btnSelectDirectory!
+    field private BBjButton         btnSearch!
+    field private BBjStandardGrid   gridResults!
+    field private BBjStatusBar      status!
+    field private BBjBusyIndicator  busyIndicator!
+
+    rem Data collections for files and links
+    field private BBjVector         vectFiles!
+    field private BBjVector         vectLinks!
+
+    rem Most recently used (MRUs) starting directories
+    field private BBjNumber         mruMaxItems = 25
+    field private LinkedHashMap     mruDirs!
+    field private LinkedHashMap     mruFileNames!
+
+    rem User Preferences
+    field private HashMap           hashPrefs!
+    field private BBjString         optTheme! = "light"
+    field private BBjString         optWorkingDir! = dsk("")+dir("")
+    field private BBjString         optFileName! = ".htm"
+    field private BBjString         optFileContents! = "bui.png"
+    field private BBjNumber         optIgnoreCaseFilenames = 1
+    field private BBjNumber         optIgnoreCaseContents = 1
+    field private BBjNumber         optUseRegularExpressions = 0
+    field private BBjNumber         optSearchRecursively = 1
+    field private BBjNumber         optUseBusyIndicator = 0
+    field private BBjNumber         optMode = 0
+
+    rem User Preferences descriptions (used for the cookie key)
+    field private BBjString         optThemeKey! = "optTheme"
+    field private BBjString         optWorkingDirectoryKey! = "optWorkingDirectory"
+    field private BBjString         optFileNameKey! = "optFileName"
+    field private BBjString         optFileContentsKey! = "optFileContentsString"
+    field private BBjString         optIgnoreCaseFilenamesKey! = "optIgnoreCaseFilenames"
+    field private BBjString         optIgnoreCaseContentsKey! = "optIgnoreCaseContents"
+    field private BBjString         optUseRegularExpressionsKey! = "optUseRegularExpressions"
+    field private BBjString         optSearchRecursivelyKey! = "optSearchRecursively"
+    field private BBjString         optUseBusyIndicatorKey! = "optUseBusyIndicator"
+    field private BBjString         optModeKey! = "optMode"
+    field private BBjString         optMruDirsKey! = "mruDirs"
+    field private BBjString         optMruFilesKey! = "mruFiles"
+
+
+    rem Statistics
+    field private BBjNumber         statsTotalFiles
+    field private BBjNumber         statsFilesMatchingName
+    field private BBjNumber         statsFilesMatchingNameWithContent
+    field private BBjNumber         statsFilesMatchingNameWithoutContent
+    field private BBjNumber         statsCorrectedFiles
+    field private BBjNumber         statsStartTimeMs
+    field private BBjNumber         statsStartTimeString
+    field private BBjNumber         statsGridRows
+    field private BBjNumber         statsFilesWithMultipleHeaders
+    field private BBjNumber         statsExampleCodeWithOldCallbackStyle
+    field private BBjNumber         statsFileContentsSearchTime
+    field private BBjNumber         statsStatusBarUpdates
+    field private BBjNumber         statsTotalCodeFormats
+
+    field private BBjString         outputPathDateStamp!; rem This is used to place output in a unique directory based on the date & time.  This way you can have multiple results that don't clobber one another
+    field private BBjString         patternLinkedHeader! = "<h1>.*</a>::.*</h1>"
+    field private BBjString         patternNonLinkedHeader! = "<h1>.*::.*</h1>"
+    field private BBjString         newHtmlFileLocation! =  dsk("")+dir("") + "FileFinder-Output/"
+
+    rem Misc PRIVATE fields
+    field private BBjString         childWinPanelFlag$ = $00108000$
+    field private BBjString         childWinFieldsetFlag$ = $00109000$
+    field private BBjString         dateFormatString! = "yyyy-MM-dd hh:mm:ss"
+    field private SimpleDateFormat  dateFormat! = new SimpleDateFormat(#dateFormatString!)
+
+    rem Grid-related PRIVATE fields
+    field private BBjNumber NumGridUpdates
+    field private BBjNumber NumActualGridUpdates
+    field private BBjNumber GridSortColumn
+    field private BBjNumber GridSortDirection
+    field private BBjNumber numStatusSegments
+
+    rem ========================================================================
+    rem The following fields are specific to the various modes of operation
+    rem ========================================================================
+
+    rem Mode-Specific Descriptions of the program's different utility modes
+    field private BBjString         mode0Description! = "<html><span class='utilityModeIndicator' style='background: hsl(045, 100%, 40%); color: var(--dwc-color-black); border: 1px solid hsla(0, 0%, 100%, 0.75); font-weight: bold; padding: 0.1em 0.75em; border-radius: 0.75em; '>Mode 0</span> Generic Search Directory for Files Matching Pattern"
+    field private BBjString         mode1Description! = "<html><span class='utilityModeIndicator' style='background: hsl(090, 100%, 25%); color: var(--dwc-color-white); border: 1px solid hsla(0, 0%, 100%, 0.75); font-weight: bold; padding: 0.1em 0.75em; border-radius: 0.75em;  '>Mode 1</span> Generic Search Directory for Files Matching Pattern that Contain a String"
+    field private BBjString         mode2Description! = "<html><span class='utilityModeIndicator' style='background: hsl(135, 100%, 25%);color: var(--dwc-color-white); border: 1px solid hsla(0, 0%, 100%, 0.75); font-weight: bold; padding: 0.1em 0.75em; border-radius: 0.75em;  '>Mode 2</span> Search Directory for Documentation Files Containing Object::Method Headers"
+    field private BBjString         mode3Description! = "<html><span class='utilityModeIndicator' style='background: hsl(180, 100%, 25%);color: var(--dwc-color-white); border: 1px solid hsla(0, 0%, 100%, 0.75); font-weight: bold; padding: 0.1em 0.75em; border-radius: 0.75em;  '>Mode 3</span> Search Directory for Documentation Files With Extra Space Between H1/H2 Tags"
+    field private BBjString         mode4Description! = "<html><span class='utilityModeIndicator' style='background: hsl(225, 100%, 25%);color: var(--dwc-color-white); border: 1px solid hsla(0, 0%, 100%, 0.75); font-weight: bold; padding: 0.1em 0.75em; border-radius: 0.75em;  '>Mode 4</span> Deprecate Documentation files"
+    field private BBjString         mode5Description! = "<html><span class='utilityModeIndicator' style='background: hsl(270, 100%, 25%);color: var(--dwc-color-white); border: 1px solid hsla(0, 0%, 100%, 0.75); font-weight: bold; padding: 0.1em 0.75em; border-radius: 0.75em;  '>Mode 5</span> Fix Documentation Sample Code"
+    field private BBjString         mode6Description! = "<html><span class='utilityModeIndicator' style='background: hsl(315, 100%, 25%);color: var(--dwc-color-white); border: 1px solid hsla(0, 0%, 100%, 0.75); font-weight: bold; padding: 0.1em 0.75em; border-radius: 0.75em;  '>Mode 6</span> Fix Documentation Method Tables"
+
+    rem Mode-Specific Result Title that varies based on which mode the program is running in
+    field private BBjString         mode0Display! = " Search Results - Files that Match the File Name String "
+    field private BBjString         mode1Display! = " Search Results - Files that Match the File Name String and Contain the Sought Contents "
+    field private BBjString         mode2Display! = " Search Results - Files that Match the File Name String and Contain Object::Method Headers "
+    field private BBjString         mode3Display! = " Search Results - Files that Match the File Name String and Have Extra Header Space "
+    field private BBjString         mode4Display! = " Search Results - Files to be Deprecated "
+    field private BBjString         mode5Display! = " Search Results - Files with Sample Code to be converted to be Prism-Compatible"
+    field private BBjString         mode6Display! = " Search Results - Files with Method tables to be cleaned up"
+
+
+
+    rem ========================================================================================
+    rem PUBLIC Constants
+    rem ========================================================================================
+    rem /** A constant value that defines the <code>dark</code> DWD theme.
+    rem  * @return  A BBjString with the dark theme constant.
+    rem  */
+    method public static BBjString THEME_DARK()
+        methodret "dark"
+    methodend
+    rem /** A constant value that defines the <code>dark-pure</code> DWD theme.
+    rem  * @return  A BBjString with the dark-pure theme constant.
+    rem  */
+    method public static BBjString THEME_DARK_PURE()
+        methodret "dark-pure"
+    methodend
+    rem /** A constant value that defines the <code>light</code> DWD theme.
+    rem  * @return  A BBjString with the light theme constant.
+    rem  */
+    method public static BBjString THEME_LIGHT()
+        methodret "light"
+    methodend
+    rem /** A constant value that defines the <code>system</code> DWD theme.
+    rem  * @return  A BBjString with the system theme constant.
+    rem  */
+    method public static BBjString THEME_SYSTEM()
+        methodret "system"
+    methodend
+
+
+rem ========================================================================================
+rem PBULIC console logging constants for styling the Developer Tools console output with CSS
+rem ========================================================================================
+    field public static BBjString CssConsoleYellow!     = "'background: hsl(60, 100%, 65%); color: hsl(350, 100%, 25%); padding: 2px 4px; border-radius: 3px; border: 1px solid hsl(350, 100%, 25%);'"
+    field public static BBjString CssConsoleBlue!       = "'background: hsl(210, 100%, 95%); color: hsl(210, 65%, 40%); padding: 2px 4px; border-radius: 3px; border: 1px solid hsl(210, 65%, 40%);'"
+    field public static BBjString CssConsoleGreen!      = "'background: hsl(100, 100%, 92%); color: hsl(100, 100%, 25%); padding: 2px 4px; border-radius: 3px; border: 1px solid hsl(100, 100%, 25%);'"
+    field public static BBjString CssConsolePurple!     = "'background: hsl(275, 90%, 95%); color: hsl(275, 35%, 35%); padding: 2px 4px; border-radius: 3px; border: 1px solid hsl(275, 35%, 35%);'"
+    field public static BBjString CssConsoleOrange!     = "'background: hsl(40, 100%, 95%); color: hsl(20, 75%, 25%); padding: 2px 4px; border-radius: 3px; border: 1px solid hsl(20, 75%, 25%);'"
+    field public static BBjString CssConsoleRed!        = "'background: hsl(0, 100%, 95%); color: hsl(20, 75%, 25%); padding: 2px 4px; border-radius: 3px; border: 1px solid hsl(20, 75%, 25%);'"
+    field public static BBjString CssConsoleTurqoise!        = "'background: hsl(185, 100%, 95%); color: hsl(185, 75%, 25%); padding: 2px 4px; border-radius: 3px; border: 1px solid hsl(20, 75%, 25%);'"
+
+    field public static BBjString CssConsoleGray!               = "'background: hsl(0, 0%, 95%); color: hsl(0, 0%, 45%); font-weight: light; font-style: italic; padding: 2px 4px; border-radius: 3px; border: 1px solid hsl(0, 0%, 25%);'"
+    field public static BBjString CssConsoleHighlightRed!       = "'background: hsl(0, 100%, 50%); color: hsl(40, 100%, 90%); font-weight: 900; padding: 2px 4px; border-radius: 3px; border: 2px solid hsl(40, 100%, 50%);'"
+    field public static BBjString CssConsoleHighlightYellow!    = "'background: hsl(50, 100%, 75%); color: hsl(210, 100%, 35%); font-weight: 900; padding: 2px 4px; border-radius: 3px; border: 2px solid hsl(40, 100%, 50%);'"
+    field public static BBjString CssConsoleHighlightBlue!      = "'background: hsl(210, 100%, 35%); color: hsl(210, 100%, 90%); font-weight: 900; padding: 2px 4px; border-radius: 3px; border: 2px solid hsl(210, 100%, 90%);'"
+    field public static BBjString CssConsoleHighlightGreen!     = "'background: hsl(115, 100%, 30%); color: hsl(115, 100%, 90%); font-weight: 900; padding: 2px 4px; border-radius: 3px; border: 2px solid hsl(115, 100%, 90%);'"
+    field public static BBjString CssConsoleHighlightTeal!      = "'background: hsl(185, 100%, 35%); color: hsl(185, 75%, 90%); padding: 2px 4px; border-radius: 3px; border: 1px solid hsl(185, 75%, 90%);'"
+    field public static BBjString CssConsoleHighlightPurple!    = "'background: hsl(265, 100%, 35%); color: hsl(250, 75%, 90%); padding: 2px 4px; border-radius: 3px; border: 1px solid hsl(250, 75%, 90%);'"
+
+
+
+    rem ========================================================================================
+    rem CONSTRUCTORS
+    rem ========================================================================================
+
+    rem /**
+    rem  * The default constructor that does not require any parameters.  Using this constructor
+    rem  * results in setting the app's working directory to BBj's current working directory.
+    rem  */
+    method public FileFinder()
+        #this!(dsk("")+dir(""))
+    methodend
+
+    rem /**
+    rem  * A constructor that takes the initial directory from which to search as a parameter.
+    rem  *
+    rem  * @param BBjString startingDirectory!   The starting directory to use when searching for files
+    rem  */
+    method public FileFinder(BBjString startingDirectory!)
+        declare auto BBjCommandLineObject cmdLine!
+
+        rem Check the client using the INFO() function
+        rem ===========================================
+        if (info(3,6)="1") then
+            rem Running in GUI  (BBj 4.00+)
+        endif
+
+        if (info(3,6)="5") then
+            rem Running in BUI (BBj 10.00+)
+        endif
+
+        if (info(3,6)="6") then
+            rem Running in DWC (BBj 21.10+)
+        endif
+
+        if (info(3,6)="7") then
+            rem Running as a Desktop App (BBj 22.11+)
+        endif
+
+
+        rem Only run in the DWC client, as the program uses CSS for layout which is only available in the DWC
+        if (info(3,6)<>"6") then
+
+            title! = "Unsupported Client "
+            switch info(3,6)
+                case "1"; title! = title! + "(GUI)"; break
+                case "5"; title! = title! + "(BUI)"; break
+                case "7"; title! = title! + "(Desktop App)"; break
+            swend
+
+            msg! = "<html><style>html,body{whitespace:normal;}code{font-weight:bold;}</style><div>"
+            msg! = msg! + "<p>This program <i>only</i> runs in the DWC.</p><p>The DWC uses the <code>webapp</code> context by default.  Your URL pattern should look like: "
+            msg! = msg! + "<dl><dd><code>http[s]://&lt;host&gt;:8888/webapp/&lt;app-name&gt;</code>.</p></dd></dl>"
+
+            web! = BBjAPI().getWebManager(err=*NEXT)
+            appUrl! = web!.getUrl(err=*NEXT)
+            if (appUrl! <> null()) then
+                rem Since we got the web manager and app URL, we're running in BUI and *ought* to be able to construct a valid URL
+                 appUrl! = appUrl!.replace("/apps/", "/webapp/")
+
+                rem We should try to get the web app and ensure that it's enabled for the DWC, but that's only possible if we know the admin login credentials
+                admin! = bbjapi().getAdmin("admin","admin123",err=*NEXT)
+                appServer! = admin!.getWebAppServer(err=*NEXT)
+                if (appServer! <> null()) then
+                    app! = appServer!.getApplication(web!.getApplicationName(err=*NEXT),err=*NEXT)
+                    if (app! <> null()) then
+                        if (app!.isDwcEnabled()) then
+                            rem We could do everything we needed, so we'll browse to the DWC URL and pretend that the user never specified the BUI URL
+                            BBjAPI().getThinClient().browse(appUrl!)
+                        endif
+                    endif
+                endif
+
+                rem If we're here, then we couldn't automatically browse to the DWC app, so we'll provide more information for the user
+                msg! = msg! + "<p>Or, more specifically: <code><a href='" + appUrl! + "' target='_self'>" + appUrl! + "</a></code>.</p>"
+                msg! = msg! + "<p>Please check your URL and try again.</p></div></html>"
+
+                rem Show the message box and give them the option to browse to the DWC URL
+                temp = msgbox(msg!, BBjSysGui.MSGBOX_ICON_STOP + BBjSysGui.MSGBOX_BUTTONS_CUSTOM, title!, "Browse To DWC URL", "Cancel", mode="theme=danger")
+                if (temp = 1) then
+                    BBjAPI().getThinClient().browse(appUrl!)
+                else
+                    release
+                endif
+
+            else
+                rem We're in GUI or a Desktop App, so we'll just display an error box and let the user figure out how to proceed.
+                msg! = msg! + "<p>Please check your URL and try again.</p></div></html>"
+                temp = msgbox(msg!, BBjSysGui.MSGBOX_ICON_STOP + BBjSysGui.MSGBOX_BUTTONS_OK, title!, mode="theme=danger")
+                release
+            endif
+
+        endif
+
+
+
+        rem Only run in the DWC client
+        if (info(3,6)<>"6") then
+            temp = msgbox("This program only runs in the DWC.  Select [OK] to launch it in the browser, or [Cancel] to quit.", BBjSysGui.MSGBOX_ICON_STOP + BBjSysGui.MSGBOX_BUTTONS_OK_CANCEL, "Unsupported Client")
+            if (temp = BBjSysGui.MSGBOX_RETURN_CANCEL) then release
+
+            rem When the program is run in GUI, it registers itself as a DWC app and launches in the default browser
+            if (info(3,6) = "1") then
+                appFullPath! = pgm(-1)
+                appFullPath! = appFullPath!.replaceAll("\\", "/")
+                if !(appFullPath!.contains("/")) then appFullPath! = dsk("")+dir("") + appFullPath!
+                appName! = appFullPath!.substring(appFullPath!.lastIndexOf("/")+1)
+                if (appName!.toLowerCase().endsWith(".bbj")) then appName! = appName!.substring(0, len(appName!)-4)
+                appDirectory! = appFullPath!.substring(0, appFullPath!.lastIndexOf("/"))
+                CALL System.getProperty("basis.BBjHome") + "/demos/Common/registerBUIAppWithCSS.src",pgm(-2)
+                BBjAPI().getThinClient().browse("http://localhost:8888/webapp/" + appName!)
+                release
+            endif
+
+            rem When the program is run in BUI, changes the URL to run in the default DWC context instead
+            if (info(3,6) = "5") then
+                url! = #webManager!.getUrl().replaceAll("apps", "webapp")
+                action! = #webManager!.urlAction(url!)
+                #webManager!.setEndAction(action!)
+                release
+            endif
+        endif
+
+        #optWorkingDir! = startingDirectory!
+        SysGUI$ = "X0"
+        #SysGuiChannel = unt
+        open (#SysGuiChannel)SysGUI$
+        #SysGui! = BBjAPI().getSysGui()
+        #busyIndicator!= BBjAPI().getWebManager().getBusyIndicator()
+        #webManager! = BBjAPI().getWebManager()
+    methodend
+
+
+
+    rem /**
+    rem  * Runs the app and displays the user interface
+    rem  */
+    method public void run()
+
+        rem Error trapping
+        rem ========================================================================================
+        seterr OnError
+
+        rem Write out initial debug
+        #consoleLog("Starting at " + date(0:"%Y-%Mz-%Dz %Hz:%mz:%sz") + ", Status: #Debug = " + str(#Debug), 1)
+
+        rem Define the Most Recently Used (MRUs) lists: The last TRUE parameter forces ordering to be access order instead of insertion order
+        #mruDirs! = new LinkedHashMap(#mruMaxItems, new Float(.75), Boolean.TRUE)
+        #mruFileNames! = new LinkedHashMap(#mruMaxItems, new Float(.75), Boolean.TRUE)
+
+        rem Populate the MRUs with a couple of sample file types
+        key! = ".jpg"; #mruFileNames!.put(key!, key!)
+        key! = ".png"; #mruFileNames!.put(key!, key!)
+        key! = ".htm"; #mruFileNames!.put(key!, key!)
+        key! = ".css"; #mruFileNames!.put(key!, key!)
+        key! = ".bbj"; #mruFileNames!.put(key!, key!)
+        key! = ".txt"; #mruFileNames!.put(key!, key!)
+
+        rem Create the default user preferences that are stored in the #hashPrefs! HashMap
+        rem Note that we're converting the MRUs to Json strings, and we do the opposite when we read them back in
+        #hashPrefs! = new HashMap()
+        #hashPrefs!.put(#optFileNameKey!,               ".htm")
+        #hashPrefs!.put(#optFileContentsKey!,           "<a.*></a>")
+        #hashPrefs!.put(#optWorkingDirectoryKey!,       #optWorkingDir!)
+        #hashPrefs!.put(#optThemeKey!,                  #optTheme!)
+        #hashPrefs!.put(#optModeKey!,                   str(#optMode))
+        #hashPrefs!.put(#optIgnoreCaseFilenamesKey!,    str(#optIgnoreCaseFilenames))
+        #hashPrefs!.put(#optIgnoreCaseContentsKey!,     str(#optIgnoreCaseContents))
+        #hashPrefs!.put(#optUseRegularExpressionsKey!,  str(#optUseRegularExpressions))
+        #hashPrefs!.put(#optSearchRecursivelyKey!,      str(#optSearchRecursively))
+        #hashPrefs!.put(#optUseBusyIndicatorKey!,       str(#optUseBusyIndicator))
+        #hashPrefs!.put(#optMruDirsKey!,                #getJsonFromMru(#mruDirs!).toString())
+        #hashPrefs!.put(#optMruFilesKey!,               #getJsonFromMru(#mruFileNames!).toString())
+
+
+        rem Read the user's preferences from a cookie, then apply all parameters with a matching key in the default hashmap
+        hashPrefsFromCookie! = DemoUtils.getCookies(#appName!,err=*NEXT)
+        if (hashPrefsFromCookie! <> null()) then
+            it! = hashPrefsFromCookie!.keySet().iterator()
+            while (it!.hasNext())
+                key! = it!.next()
+                if (#hashPrefs!.containsKey(key!)) then
+                    value! = hashPrefsFromCookie!.get(key!)
+                    #hashPrefs!.put(key!, str(value!))
+                endif
+            wend
+        endif
+        #optTheme! = #hashPrefs!.get(#optThemeKey!,err=*NEXT).toString()
+        #optWorkingDir! = #hashPrefs!.get(#optWorkingDirectoryKey!,err=*NEXT).toString()
+        #optFileName! = #hashPrefs!.get(#optFileNameKey!,err=*NEXT).toString()
+        #optFileContents! = #hashPrefs!.get(#optFileContentsKey!,err=*NEXT).toString()
+        #optIgnoreCaseFilenames = num(#hashPrefs!.get(#optIgnoreCaseFilenamesKey!,err=*NEXT).toString())
+        #optIgnoreCaseContents = num(#hashPrefs!.get(#optIgnoreCaseContentsKey!,err=*NEXT).toString())
+        #optUseRegularExpressions = num(#hashPrefs!.get(#optUseRegularExpressionsKey!,err=*NEXT).toString())
+        #optSearchRecursively = num(#hashPrefs!.get(#optSearchRecursivelyKey!,err=*NEXT).toString())
+        #optMode = num(#hashPrefs!.get(#optModeKey!,err=*NEXT).toString(),err=*NEXT)
+        #optUseBusyIndicator = num(#hashPrefs!.get(#optUseBusyIndicatorKey!,err=*NEXT).toString(),err=*NEXT)
+        #mruDirs! = #getMruFromJsonString(#hashPrefs!.get(#optMruDirsKey!,err=*NEXT).toString(), #mruMaxItems)
+        #mruFileNames! = #getMruFromJsonString(#hashPrefs!.get(#optMruFilesKey!,err=*NEXT).toString(), #mruMaxItems)
+
+        rem Apply the user's preferences
+        #setTheme(#optTheme!)
+
+        rem Define the possible utility modes
+        #vectUtilityModes! = BBjAPI().makeVector()
+        #vectUtilityModes!.addItem(#mode0Description!)
+        #vectUtilityModes!.addItem(#mode1Description!)
+
+        rem Define the main window and its controls
+        rem ========================================================================================
+        #winOuter! = #SysGui!.addWindow("BBj File Finder Utility", $01091093$)
+        #winOuter!.setMinimumSize(905, 645)
+        #winOuter!.addStyle("winOuter")
+
+        rem Set the window's icon and the browser tab icon
+        iconFile! = dsk("")+dir("")+"FileFinder.svg"
+        #winOuter!.setIcon(iconFile!)
+        url! = BBUtils.copyFileToWebServer(iconFile!, "images")
+        attrib! = "rel=icon,type=image/svg,id=file_searcher_css"
+        #webManager!.injectLinkUrl(url!, 1, attrib!)
+
+        rem Set the app's icon shown in the browser tab
+        rem url! = "https://bbjserver.basis.cloud:8443/files/images/iconPurple.svg"
+        rem attrib! = "rel=icon,type=image/svg,id=file_searcher_icon"
+        rem #webManager!.injectLinkUrl(url!, 1, attrib!)
+
+        rem Inject the app's CSS
+        cssFilePath! = dsk("") + dir("") + #appName! + ".css"
+        css! = java.nio.file.Files.readAllBytes(java.nio.file.Path.of(cssFilePath!))
+        applyToTopWindow = 0
+        #webManager!.injectStyle(css!, applyToTopWindow, "id=my_custom_css")
+
+
+        #winConfig! = #winOuter!.addChildWindow("Configuration",#childWinFieldsetFlag$,#SysGui!.getAvailableContext())
+        #winConfig!.addStyle("winConfig")
+
+        #lstMode! = #winConfig!.addListButton(String.join($0a$, cast(Iterable, #vectUtilityModes!)))
+        #lstMode!.addStyle("lstMode")
+        #lstMode!.setAttribute("label", "Finder Mode: ")
+        #lstMode!.setAttribute("theme", "outlined-primary")
+        #lstMode!.setAttribute("button-height", "unset")
+        #lstMode!.selectIndex(#optMode)
+
+        rem Search button
+        REM #btnSearch! = #winConfig!.addButton("Start File Search")
+        REM #btnSearch! = #winConfig!.addButton("<html><bbj-icon pool='tabler' name='settings' class='bbj-icon icon-settings'></bbj-icon>")
+        #btnSearch! = #winConfig!.addButton("<html><bbj-icon pool='tabler' name='settings' class='bbj-icon icon-settings'></bbj-icon> Search")
+        #btnSearch!.addStyle("btnSearch")
+        REM #btnSearch!.setAttribute("expanse", "l")
+        #btnSearch!.setAttribute("theme", "warning")
+
+
+        rem Parameters
+        rem ========================================================================================
+        rem The Working Directory ListButton
+        #lstWorkingDir!  = #winConfig!.addListButton(#getMruForListButton(#mruDirs!))
+        #lstWorkingDir!.addStyle("lstWorkingDir")
+        #lstWorkingDir!.setAttribute("theme", "outlined-primary")
+        #lstWorkingDir!.setAttribute("label", "Directory: ")
+        #lstWorkingDir!.setAttribute("button-height", "unset")
+        #lstWorkingDir!.selectIndex(0)
+
+        rem Get the appropriate working directory from the cookie or fallback to the CWD
+        desiredWorkingDir! = dsk("")+dir("")
+        desiredWorkingDir! = #lstWorkingDir!.getAllItems(err=*NEXT).get(0,err=*NEXT).toString(err=*NEXT)
+        fileDesiredWorkingDir! = new File(desiredWorkingDir!)
+        if (desiredWorkingDir! = null()) OR ((fileDesiredWorkingDir! <> null()) AND (fileDesiredWorkingDir!.exists() = 0)) then
+            desiredWorkingDir! = DSK("") + DIR("")
+        endif
+        #consoleLog("Setting the working directory to: " + desiredWorkingDir!, 1)
+        #setStartingDirectory(desiredWorkingDir!)
+
+
+        #btnSelectDirectory! = #winConfig!.addButton("Select Directory ...")
+        #btnSelectDirectory!.addStyle("btnSelectDirectory")
+        #btnSelectDirectory!.setAttribute("theme", "outlined-primary")
+
+        #lstFileName! = #winConfig!.addListEdit(#getMruForListButton(#mruFileNames!))
+        #lstFileName!.addStyle("lstFileName")
+        #lstFileName!.setAttribute("toggle-on-enter", "false")
+        #lstFileName!.setAttribute("label", "File Name: ")
+        #lstFileName!.setAttribute("field-height", "unset")
+        #lstFileName!.selectIndex(0)
+        #setFileNamePattern(#lstFileName!.getAllItems().get(0).toString())
+        #lstFileName!.setPlaceholder("File Name Pattern (leave empty to match all files)")
+
+        #edtContents! = #winConfig!.addEditBox(#optFileContents!)
+        #edtContents!.addStyle("edtContents")
+        #edtContents!.setPlaceholder("Enter text to search for in files")
+        #edtContents!.setAttribute("label", "File Contents: ")
+
+        rem Search Options
+        rem ========================================================================================
+        #winSearchOptions! = #winConfig!.addChildWindow("Search Options",#childWinFieldsetFlag$,#SysGui!.getAvailableContext())
+        #winSearchOptions!.addStyle("winSearchOptions")
+        #chkRecursive! = #winSearchOptions!.addCheckBox("Search Directory Recursively")
+        #chkIgnoreCaseFilenames! = #winSearchOptions!.addCheckBox("Ignore Case for Filenames")
+        #chkIgnoreCaseContents! = #winSearchOptions!.addCheckBox("Ignore Case for Contents")
+        #chkRegEx! = #winSearchOptions!.addCheckBox("Use RegEx for Contents")
+
+        rem Set the state of the checkboxes to match saved preferences
+        #chkIgnoreCaseFilenames!.setSelected(#optIgnoreCaseFilenames)
+        #chkIgnoreCaseContents!.setSelected(#optIgnoreCaseContents)
+        #chkRegEx!.setSelected(#optUseRegularExpressions)
+        #chkRecursive!.setSelected(#optSearchRecursively)
+
+        rem Create the Result Area with the grid
+        rem ========================================================================================
+        #winResults! = #winOuter!.addChildWindow("Search Results",#childWinFieldsetFlag$,#SysGui!.getAvailableContext())
+        #winResults!.addStyle("winResults")
+
+        #gridResults! = #winResults!.addGrid(#winResults!.getAvailableControlID(),0,0,0,0)
+        #gridResults!.setNumColumns(4)
+        #gridResults!.setSelectionMode(BBjGrid.SELECT_ROW_MODE)
+        #gridResults!.setHasColumnHeader(1)
+        vectHeaderTxt! = BBjAPI().makeVector()
+        vectHeaderTxt!.addItem("Name"); vectHeaderTxt!.addItem("Path"); vectHeaderTxt!.addItem("Size"); vectHeaderTxt!.addItem("Date Modified")
+        #gridResults!.setColumnHeaderText(vectHeaderTxt!)
+        #gridResults!.setEditable(0)
+        #emptyBBjGrid(#gridResults!)
+
+        rem Add the status bar
+        #numStatusSegments = 5
+        segmentWidth = int(100/#numStatusSegments)
+        #status! = #winOuter!.addStatusBar()
+        vect! = BBjAPI().makeVector()
+        for segment = 0 to #numStatusSegments - 1
+            vect!.addItem(segmentWidth * (segment + 1))
+        next segment
+        #status!.setSegments(vect!)
+        #status!.setTextAt(0, "<html><span class='statusLabel'>Ready</span>")
+
+        #OnSelectUtilityMode(null())
+
+        rem Callbacks for main window controls
+        rem ========================================================================================
+        #winOuter!.setCallback(BBjControl.ON_CLOSE, #this!, "onExit")
+        #btnSelectDirectory!.setCallback(BBjButton.ON_BUTTON_PUSH, #this!, "onSelectDirectory")
+        #btnSearch!.setCallback(BBjButton.ON_BUTTON_PUSH, #this!, "onSearch")
+        #lstWorkingDir!.setCallback(BBjListButton.ON_LIST_CHANGE, #this!, "onListDirectoryChange")
+
+        #chkIgnoreCaseFilenames!.setCallback(BBjCheckBox.ON_CHECK_CHANGE, #this!, "onCheckIgnoreCaseFilenames")
+        #chkIgnoreCaseContents!.setCallback(BBjCheckBox.ON_CHECK_CHANGE, #this!, "onCheckIgnoreCaseFileContents")
+        #chkRegEx!.setCallback(BBjCheckBox.ON_CHECK_CHANGE, #this!, "onCheckRegEx")
+        #chkRecursive!.setCallback(BBjCheckBox.ON_CHECK_CHANGE, #this!, "onCheckRecursive")
+        #lstMode!.setCallback(BBjListButton.ON_LIST_CHANGE, #this!, "OnSelectUtilityMode")
+rem         #lstFileName!.setCallback(BBjEditBox.ON_EDIT_MODIFY, #this!, "onEditFileName")
+        #lstFileName!.setCallback(BBjEditBox.ON_LIST_CHANGE, #this!, "onListFileNameChange")
+        #edtContents!.setCallback(BBjEditBox.ON_EDIT_MODIFY, #this!, "onEditContents")
+        #edtContents!.setCallback(BBjEditBox.ON_EDIT_KEYPRESS, #this!, "onKeypressContents")
+        REM #lstFileName!.setCallback(BBjListEdit.ON_EDIT_KEYPRESS, #this!, "onKeypressFileName")
+        REM #gridResults!.setCallback(BBjStandardGrid.ON_GRID_DOUBLE_CLICK, #this!, "onGridDoubleClick")
+
+        rem These grid callbacks are currently undefined
+        REM #gridResults!.setCallback(BBjStandardGrid.ON_GRID_SELECT_ROW, #this!, "onGridSelectRow")
+        REM #gridResults!.setCallback(BBjStandardGrid.ON_GRID_MOUSE_UP, #this!, "onGridMouseUp")
+        REM #gridResults!.setCallback(BBjStandardGrid.ON_GRID_MOUSE_DOWN, #this!, "onGridMouseDown")
+
+        rem Show the main window and Process Events
+        rem ========================================================================================
+        #winOuter!.setVisible(1)
+        process_events
+
+
+        OnError:
+        endtrace
+        msg$ = "Error " + str(err) + " on line " + str(tcb(5)) + " of " + PGM(-1, TCB(13)) + $0d0a$ + "Error Message: " + errmes(-1)
+        temp = msgbox(msg$, BBjSysGui.MSGBOX_ICON_STOP, "Error Information", mode="theme=danger")
+        release
+
+    methodend
+
+
+
+
+    rem /** Sets the starting working directory for the utility
+    rem  * <p>
+    rem  * Additionally, this method will ensure that the path ends with a separator, it will
+    rem  * save out the directory in the user's cookies, add it to the MRU, and fill the
+    rem  * Starting Directory ListButton with the MRU and select the index of the chosen
+    rem  * directory if the ListButton exists.
+    rem  *
+    rem  * BBjString startingDirectory!    The starting working directory that the utility uses when searching for files
+    rem  */
+    method public void setStartingDirectory(BBjString startingDirectory!)
+        rem Set the sanitized version of the working dir and save to cookies and the MRU
+        #optWorkingDir! = DemoUtils.getFilePathWithEndSeparator(startingDirectory!)
+
+        fileWorkingDir! = new File(startingDirectory!)
+        if (fileWorkingDir!.exists() = 0) then
+            a=msgbox("Working directory '" + startingDirectory! + "' does not exist, falling back to current directory", 64, "Non-Existant Working Directory", mode="theme=info")
+            startingDirectory! = dsk("") + dir("")
+        endif
+
+        #mruDirs!.put(#optWorkingDir!, DemoUtils.getFileNameFromFullPath(#optWorkingDir!))
+        #consoleLog("#optWorkingDir! = " + str(#optWorkingDir!), 1)
+
+        #hashPrefs!.put(#optWorkingDirectoryKey!,       #optWorkingDir!)
+        #hashPrefs!.put(#optMruDirsKey!,                #getJsonFromMru(#mruDirs!).toString())
+        #saveCookies()
+
+        rem See if we ought to reload the ListButton's list because the MRU may have changed
+        if (#lstWorkingDir! <> null()) then
+
+            rem See if the ListButton's list differs from the MRU - remember to reverse the MRU's order, as it's in least-recently used order
+            vectListButton! = #lstWorkingDir!.getAllItems()
+            vectMRU! = new java.util.Vector(#mruDirs!.keySet())
+            java.util.Collections.reverse(vectMRU!)
+
+            rem Reload the contents based on the MRU, but only if the contents are different to avoid an unnecessary flash
+            if (vectListButton! <> vectMRU!) then
+                #lstWorkingDir!.removeAllItems()
+                #lstWorkingDir!.insertItems(0,#getMruForListButton(#mruDirs!))
+                #lstWorkingDir!.selectIndex(#lstWorkingDir!.getAllItems().indexOf(#optWorkingDir!))
+            endif
+
+        endif
+    methodend
+
+
+    rem /**
+    rem  * Sets the mode in which the utility operates, so that it does different things.
+    rem  * This is called as a result of the user selecting a mode from the BBjListButton
+    rem  */
+    method protected void OnSelectUtilityMode(BBjListChangeEvent event!)
+        if (event! <> null()) then
+            index = event!.getSelectedIndex()
+        else
+            index = #optMode
+        endif
+        #optMode = index
+
+        rem Since we call this directly (as opposed to just as a result of the user's action)
+        rem we do a null() check since everything may not be setup yet.
+        if (#hashPrefs! <> null()) then
+            #hashPrefs!.put(#optModeKey!, str(#optMode))
+            #saveCookies()
+        endif
+
+        switch #optMode
+            case 0
+                rem "Generic Search Directory for Files Matching Pattern"
+                REM #btnSearch!.setText("Start File Search")
+                #edtContents!.setVisible(0)
+                #chkRegEx!.setVisible(0)
+                #chkIgnoreCaseContents!.setVisible(0)
+                #winResults!.setText(#mode0Display!)
+                break
+            case 1
+                rem "Generic Search Directory for Files Matching Pattern that Contain a String"
+                REM #btnSearch!.setText("Start File Search")
+                #edtContents!.setVisible(1)
+                #chkRegEx!.setVisible(1)
+                #chkIgnoreCaseContents!.setVisible(1)
+                #winResults!.setText(#mode1Display!)
+                break
+         swend
+        #emptyBBjGrid(#gridResults!)
+        #clearStatusBar()
+    methodend
+
+
+    rem /**
+    rem  * Kicks off the file search routine
+    rem  */
+    method protected void onSearch(BBjButtonPushEvent p_event!)
+
+REM         cmdLine! = BBjAPI().getConfig().getCurrentCommandLineObject()
+REM         cmdLine!.setMessage("BBj FileSearcher Utility - workingDirectory!")
+
+        rem Clear everything out from previous runs
+        #hashPrefs!.put(#optFileContentsKey!, #optFileContents!)
+        #hashExampleCodeWithOldCallbacks! = new HashMap()
+        #vectFiles! = BBjAPI().makeVector()
+        #vectLinks! = BBjAPI().makeVector()
+        #emptyBBjGrid(#gridResults!)
+        #statsStatusBarUpdates = 0
+        #statsTotalCodeFormats = 0
+        #statsTotalFiles = 0
+        #statsFilesMatchingName = 0
+        #statsFilesMatchingNameWithContent = 0
+        #statsFilesMatchingNameWithoutContent = 0
+        #statsCorrectedFiles = 0
+        #statsFilesWithMultipleHeaders = 0
+        #statsExampleCodeWithOldCallbackStyle = 0
+        #statsFileContentsSearchTime = 0
+
+
+        #NumGridUpdates = 0
+        #NumActualGridUpdates = 0
+        #GridSortColumn = -1
+        #GridSortDirection = 0
+
+        rem Ensure that the file name pattern is set correctly
+        fileNamePattern! = #lstFileName!.getText()
+        if (fileNamePattern! <> #optFileName!) then
+            #setFileNamePattern(fileNamePattern!)
+        endif
+
+        rem Show the indicators to let the user know that we're searching
+        html! = "<html><span style='font-size:var(--bbj-font-size-l);'>Searching..."
+        #busyIndicator!.setHtml(html!)
+        #busyIndicator!.setAttribute("spinner-theme", "primary")
+        #busyIndicator!.setAttribute("spinner-expanse", "2xs")
+        if (#optUseBusyIndicator) then #busyIndicator!.setVisible(1)
+        #status!.removeClass("finishedSearching",err=*NEXT)
+        #status!.addClass("searching")
+
+
+        rem Update the status bar
+        #outputPathDateStamp! = date(0:"%Y-%Mz-%Dz %Hz_%mz_%sz")
+        #statsStartTimeMs = System.nanoTime()
+        #updateStatusBar(0)
+
+
+        rem Log everything about the search that we're about to start
+        logMsg! = "Starting search with the following settings: " + $0a$ + "mode: " + str(#optMode) + $0a$ + "baseDir: " + #optWorkingDir! + $0a$ + "files matching: " + #optFileName!  + $0a$
+        if (#optMode = 1) then logMsg! = logMsg! + "contents matching: " + #optFileContents! + $0a$
+        if (#optIgnoreCaseFilenames) then
+            logMsg! = logMsg! + "case-insensitive file search" + $0a$
+        else
+            logMsg! = logMsg! + "case-sensitive file search" + $0a$
+        endif
+        if (#optMode = 2) then
+            logMsg! = logMsg! + "contents matching: " + #patternLinkedHeader! + $0a$
+        endif
+
+        if (#optMode > 0) then
+            if (#optUseRegularExpressions) then
+                logMsg! = logMsg! + "RegEx contents search"
+            else
+                logMsg! = logMsg! + "contains() contents search"
+            endif
+        endif
+        #consoleLog(logMsg!.trim(), 1)
+
+        rem This kicks off the entire search process
+        #getMatchingFilesFromDirectory(#optWorkingDir!)
+
+        rem Now that the search is completed, remove the searching indicators and update the status bar with the final results
+        if (#optUseBusyIndicator) then #busyIndicator!.setVisible(0)
+        #status!.removeClass("searching")
+        #status!.addClass("finishedSearching")
+        #updateStatusBar(1)
+
+        rem Fill the grid with the FINAL list of matched files since we're done searching (and possibly recursing) the working directory.
+        switch #optMode
+            case 0
+                rem "Generic Search Directory for Files Matching Pattern"
+                #updateGridWithResults(#vectFiles!)
+                break
+            case 1
+                rem "Generic Search Directory for Files Matching Pattern that Contain a String"
+                #updateGridWithResults(#vectLinks!)
+                break
+            case 2
+                rem "Search Directory for Documentation Files Containing Object::Method Headers"
+                #updateGridWithResults(#vectLinks!)
+                close(#chanLinkedHeader)
+                close(#chanNonLinkedHeader)
+                close(#chanMultipleHeaders)
+                close(#chanEmptyTitle)
+                close(#chanMissingTitleMethod)
+                close(#chanExistingTitleMethod)
+                #consoleLog("Found " + str(#statsFilesWithMultipleHeaders) + " files with multiple H1 tags", 1)
+                break
+
+            case default
+                #updateGridWithResults(#vectLinks!)
+                break
+        swend
+
+        #consoleLog("Total Grid Updates: " + str(#NumGridUpdates) + ", Actual Updates: " + str(#NumActualGridUpdates),#CssConsoleHighlightRed!,1)
+    methodend
+
+
+    rem /**
+    rem  * Returns the number of rows in the grid given a vector.  Since a BBjGrid is filled
+    rem  * via a vector, you can get the number of rows that the grid would have if it
+    rem  * were to be filled with the provided vector.  This simply returns the number of
+    rem  * items in the vector divided by the number of columns in the grid.
+    rem  *
+    rem  * @param BBjString directoryPath!      The directory to scan for matching files
+    rem  */
+    method protected BBjNumber getNumGridRowsFromVector(BBjVector vector!)
+        methodret int(vector!.size() / #gridResults!.getNumColumns())
+    methodend
+
+
+    rem /**
+    rem  * Clears out the results grid
+    rem  */
+    method protected void emptyBBjGrid(BBjStandardGrid p_grid!)
+        p_grid!.clearText()
+        p_grid!.setNumRows(1)
+        p_grid!.setCellText(0,0,"No Rows To Show")
+        #statsGridRows = 0
+    methodend
+
+
+    rem /**
+    rem  * Clears the status bar so that it no longer displays the overview of previous searches
+    rem  */
+    method protected void clearStatusBar()
+        rem Update the first few segments that are valid for all modes
+        #status!.setTextAt(0, "<html><span class='statusLabel'>Total Files: </span><span class='statusValue'>" + #getFormattedStringFromNumber(#statsTotalFiles, 0) + "</span>")
+        for segment = 1 to #numStatusSegments - 1
+            #status!.setTextAt(segment, "")
+        next segment
+    methodend
+
+    rem /**
+    rem  * Update the status bar with search information
+    rem  * <p>
+    rem  * This is called multiple times while searching
+    rem  */
+    method protected void updateStatusBar(BBjNumber showFinalResults)
+        rem Update the first few segments that are valid for all modes
+        #status!.setTextAt(0, "<html><span class='statusLabel'>Total Files: </span><span class='statusValue'>" + #getFormattedStringFromNumber(#statsTotalFiles, 0) + "</span>")
+        #status!.setTextAt(1, "<html><span class='statusLabel'>Matched Files: </span><span class='statusValue'>" + #getFormattedStringFromNumber(#statsFilesMatchingName, 0) + "</span>")
+
+        rem Either update the remaining segments with data, or if they don't apply for the
+        rem current utility mode, then clear them out
+        if (#optMode = 0) then
+            #status!.setTextAt(2, "")
+            #status!.setTextAt(3, "")
+        endif
+        if (#optMode = 1) then
+            #status!.setTextAt(2, "<html><span class='statusLabel'>Matched Files w/o Content: </span><span class='statusValue'>" + #getFormattedStringFromNumber(#statsFilesMatchingNameWithoutContent, 0) + "</span>")
+            #status!.setTextAt(3, "<html><span class='statusLabel'>Matched Files with Content: </span><span class='statusValue'>" + #getFormattedStringFromNumber(#statsFilesMatchingNameWithContent, 0) + "</span>")
+        endif
+
+        rem Update the timer for the last segment
+        totalSeconds = (System.nanoTime() - #statsStartTimeMs)/1000000000
+        totalMins = int(totalSeconds/60)
+        totalSecs = int(totalSeconds - (totalMins*60))
+        mins = int(totalSecs/60)
+        secs = totalSecs - (mins*60)
+        secPortion = totalSeconds - mins - secs
+        timeString$ = cvs(str(mins:"#00") + ":" + str(int(secs):"00"), 3)
+        if (showFinalResults) then
+            #status!.setTextAt(4, "<html><span class='statusComplete'>Search Complete: </span><span class='statusValue'>" + timeString$ + str(secPortion) + "</span>")
+        else
+            #status!.setTextAt(4, "<html><span class='statusLabel'>Searching: </span><span class='statusValue'>" + timeString$ + "</span>")
+        endif
+    methodend
+
+    rem /**
+    rem  * Returns a formatted string version of a number, so providing 12345 returns "12,345"
+    rem  *
+    rem  * @param BBjNumber numToFormat         The number to format
+    rem  * @param BBjNumber numDecimalPlaces    The number of digits to include past the decimal point
+    rem  *
+    rem  * @return                              A BBjString with a formatted version of the number
+    rem  */
+    method public BBjString getFormattedStringFromNumber(BBjNumber numToFormat, BBjNumber numDecimalPlaces)
+        formatString! = "#,###,###,##0"
+        if (numDecimalPlaces) then
+            formatString! = formatString! + "." + fill(numDecimalPlaces, "0")
+        endif
+         methodret cvs(str(numToFormat:formatString!), 3)
+    methodend
+
+
+    rem /**
+    rem  * Gets the matching files from the specified directory.  All of the modes do this.
+    rem  *
+    rem  * @param BBjString directoryPath!      The directory to scan for matching files
+    rem  */
+    method protected void getMatchingFilesFromDirectory(BBjString directoryPath!)
+        declare File javaDir!
+        declare File childFile!
+
+        rem Sanitize directory path
+        directoryPath! = directoryPath!.replaceAll("\\","/")
+        directoryPath! = DemoUtils.getFilePathWithEndSeparator(directoryPath!)
+        #consoleLog("In getMatchingFilesFromDirectory() with directory = " + directoryPath!)
+
+        javaDir! = new File(directoryPath!)
+        if !(javaDir!.exists()) then
+            throw "Source directory '" + directoryPath! + "' does not exist", 700
+        endif
+
+        if (javaDir!.isDirectory()) then
+            children! = BBjAPI().makeVector()
+            children!.addAll(java.util.Arrays.asList(javaDir!.list()))
+            if (children!.size()) then
+
+                rem Iterate through the files and subdirectories of this directory
+                for i = 0 to children!.size()-1
+
+                    rem Get the child
+                    childFileName! = children!.getItem(i)
+                    childFile! = new File(javaDir!, childFileName!)
+                    childFileFullPath! = childFile!.getAbsolutePath()
+
+                    rem Increment stats
+                    #statsTotalFiles = #statsTotalFiles + 1
+
+                    rem See if the filename matches, taking into account the case sensitivity option
+                    matched = 0
+                    if (#optIgnoreCaseFilenames) then
+                        if (childFileName!.toLowerCase().contains(#optFileName!.toLowerCase())) then matched = 1
+                    else
+                        if (childFileName!.contains(#optFileName!)) then matched = 1
+                    endif
+
+                    rem See if we've found a matching file
+                    if (matched = 1) AND (childFile!.isFile()) then
+
+                        rem Store the file's full path, size, and last modified date
+                        dateDisplay! =  #dateFormat!.format(new Date(childFile!.lastModified()))
+                        fileSize! = cvs(str(childFile!.length():"###,###,###,##0"), 3)
+
+                        rem Load the vector of matching files
+                        #vectFiles!.addItem(childFileName!)
+                        #vectFiles!.addItem(childFileFullPath!)
+                        #vectFiles!.addItem(fileSize!)
+                        #vectFiles!.addItem(dateDisplay!)
+                        #statsFilesMatchingName = #statsFilesMatchingName + 1
+
+                        rem Search inside the file for the desired content, but only for modes 1 and 2 (not 0)
+                        if (#optMode = 1) then
+                            foundSoughtString = #searchFileForSoughtContent(childFileFullPath!)
+
+                            rem Update the stats and add the file information to the secondary vector if the file contained the sought text
+                            if (foundSoughtString) then
+                                #statsFilesMatchingNameWithContent = #statsFilesMatchingNameWithContent + 1
+
+                                #vectLinks!.addItem(childFileName!)
+                                #vectLinks!.addItem(childFileFullPath!)
+                                #vectLinks!.addItem(fileSize!.trim())
+                                #vectLinks!.addItem(dateDisplay!)
+
+                                rem Update the results grid if the number of rows is a multiple of 5 to avoid a lot of updates
+                                if (mod(#getNumGridRowsFromVector(#vectLinks!), 5) = 0) then #updateGridWithResults(#vectLinks!)
+                            else
+                                #statsFilesMatchingNameWithoutContent = #statsFilesMatchingNameWithoutContent + 1
+                            endif
+
+                        endif
+
+                        rem Update the status bar and files results every once 50 files
+                        if (mod(#statsTotalFiles, 50) = 0) then
+                            #updateStatusBar(0)
+
+                            rem We only update the grid with matched files for Mode 0, all other modes will update the grid in the #searchFileForSoughtContent() method
+                            if (#optMode = 0) then #updateGridWithResults(#vectFiles!)
+                        endif
+
+                    endif
+
+                    rem If we found a directory, should we be recursive and call ourselves with the path?
+                    if (#optSearchRecursively) AND (childFile!.isDirectory()) then
+                        #getMatchingFilesFromDirectory(childFileFullPath!)
+                    endif
+
+                next
+
+            endif
+        endif
+
+    methodend
+
+
+rem ToDo    Ideally, this could be made into a generic search routine
+    rem /**
+    rem  * Searched the provided file for the sought content
+    rem  * <p>
+    rem  * This isn't a generalized routine, as it makes use of class field variables to
+    rem  * determine what it should search for and how to search for it.
+    rem  */
+    method protected BBjNumber searchFileForSoughtContent(BBjString p_fullPathToFile!)
+        declare auto BBjNumber foundSoughtString
+        declare auto File javaFile!
+        declare auto BBjString fileContents!
+        declare auto BBjString fc!
+        declare auto Pattern p!
+        declare auto Matcher m!
+        declare auto Element jH1!
+        declare auto Element jH2!
+
+        rem ========================================================================================
+        rem Configure this method's optional very detailed logging
+        rem ========================================================================================
+        veryDetailedLogging = 0
+
+        rem ========================================================================================
+        rem Search for the content
+        rem ========================================================================================
+        rem The code below uses Java's Files::readAllBytes().  I originally used Files::readString() to
+        rem read in the contents, but that defaults to UTF-8 and therefore results in an error when
+        rem reading in a binary file, such as a BBj tokenized or data file. Because of that, I switched
+        rem it to using the method that reads in the file's bytes, as it doesn't have that limitation.
+        rem Note that it can still fallback to the DemoUtils, but that shouldn't ever happen.
+        rem fileContents! = Files.readString(Path.of(p_fullPathToFile!),err=ERR_FILE_READ_ERROR)
+        fileContents! = Files.readAllBytes(Path.of(p_fullPathToFile!),err=ERR_FILE_READ_ERROR)
+
+SEARCH_CONTENTS:
+
+
+        rem From here on, we're in Mode 0 or Mode 1
+        if (#optUseRegularExpressions) then
+            rem Set default return value
+            foundSoughtString  = 0
+
+            rem Determine RegEx compilation parameters
+            compilationParams = Pattern.MULTILINE + Pattern.DOTALL
+            if (#optIgnoreCaseContents) then compilationParams = compilationParams + Pattern.CASE_INSENSITIVE
+
+            rem Search via Regular Expressions
+            rem ================================================================================
+            p! = Pattern.compile(#optFileContents!, compilationParams)
+            m! = p!.matcher( fileContents! )
+            if (m!.find())
+                #consoleLog("    Found match at position " + str(m!.start()) + ": " + m!.group(), #CssConsoleYellow!)
+                foundSoughtString = 1
+            endif
+
+            rem OPTIONAL very detailed logging for search results
+            if (veryDetailedLogging) then
+                if (foundSoughtString) then
+                    #consoleLog("REGEX: Found Sought Text (" + #optFileContents! + ") in File '" + p_fullPathToFile! + "'")
+                endif
+            else
+                #consoleLog("REGEX: Did Not Find Sought Text in File '" + p_fullPathToFile! + "'")
+            endif
+
+        else
+
+            rem Search via a simple String::contains(arg0)
+            rem ================================================================================
+            #consoleLog("CONTAINS: Checking File '" + p_fullPathToFile! + "' for text '" + #optFileContents! + "'")
+            if (#optMode = 1) then
+                if (#optIgnoreCaseContents) then
+                    if (fileContents!.toLowerCase().contains(#optFileContents!.toLowerCase())) then foundSoughtString = 1
+                else
+                    if (fileContents!.contains(#optFileContents!)) then foundSoughtString = 1
+
+                endif
+            endif
+
+            rem Very Detailed logging for search results
+            if (veryDetailedLogging) then
+                if (foundSoughtString) then
+                    #consoleLog("CONTAINS: Found Sought Text (" + #optFileContents! + ") in File '" + p_fullPathToFile! + "'")
+                else
+                    #consoleLog("CONTAINS: Did Not Find Sought Text in File '" + p_fullPathToFile! + "'")
+                endif
+            endif
+
+        endif
+
+        methodret foundSoughtString
+
+ERR_FILE_READ_ERROR:
+        rem If by any chance we got an error trying to read the file's contents with Java, we'll fall back to BBj's way of doing it.
+        #consoleLog("Error getting contents via Java for file: " + p_fullPathToFile!, 1)
+        fileContents! = DemoUtils.getFileContents(p_fullPathToFile!)
+        goto SEARCH_CONTENTS
+    methodend
+
+
+
+
+    rem /**
+    rem  * The user edited the contents pattern
+    rem  */
+    method protected void onEditContents(BBjEditModifyEvent p_event!)
+        #optFileContents! = p_event!.getText()
+        #hashPrefs!.put(#optFileContentsKey!, #optFileContents!)
+        #saveCookies()
+    methodend
+
+
+    rem /**
+    rem  * The user hit <CR> after editing the contents pattern
+    rem  */
+    method protected void onKeypressContents(BBjEditKeypressEvent p_event!)
+        if (p_event!.getKeyCode() = 13) then #onSearch(null())
+    methodend
+
+
+    rem /**
+    rem  * The user selected a new directory by selecting an item in the BBjListButton's menu
+    rem  */
+    method protected void onListDirectoryChange(BBjListChangeEvent p_event!)
+        #setStartingDirectory(p_event!.getSelectedItem())
+    methodend
+
+
+    rem /**
+    rem  * The user edited the file name pattern
+    rem  */
+    method protected void onEditFileName(BBjEditModifyEvent p_event!)
+        rem We can't set the file name pattern, because the user may still be typing.
+        rem Instead, we'll add anything that they've typed after they hit <CR> - see the next method
+        rem #setFileNamePattern(p_event!.getText())
+    methodend
+
+    rem /**
+    rem  * The user hit <CR> after editing the file name pattern
+    rem  */
+    method protected void onKeypressFileName(BBjEditKeypressEvent p_event!)
+        if (p_event!.getKeyCode() = 13) then
+            #setFileNamePattern(p_event!.getControl().getText())
+        endif
+    methodend
+
+
+    rem /**
+    rem  * The user selected a file name pattenr by selecting an item in the BBjListEdit's menu
+    rem  */
+    method protected void onListFileNameChange(BBjListChangeEvent p_event!)
+        #setFileNamePattern(p_event!.getSelectedItem())
+    methodend
+
+
+
+    rem /**
+    rem  * The user pressed the button to select a new working directory
+    rem  */
+    method protected void onSelectDirectory(BBjButtonPushEvent p_event!)
+        chosenDir$ = FILEOPEN("Select a Path to Search", #optWorkingDir!, "", "", "", 1, MODE="theme=primary,sort=+name")
+        if (chosenDir$ = "::BAD::") OR (chosenDir$ = "::CANCEL::") then methodret
+        #setStartingDirectory(chosenDir$)
+    methodend
+
+
+    rem /**
+    rem  * The user checked or unchecked the option to ignore file case when searching
+    rem  */
+    method protected void onCheckIgnoreCaseFilenames(BBjCheckChangeEvent p_event!)
+        #optIgnoreCaseFilenames = p_event!.isChecked()
+        #hashPrefs!.put(#optIgnoreCaseFilenamesKey!, str(#optIgnoreCaseFilenames))
+        #saveCookies()
+        #consoleLog("#optIgnoreCaseFilenames = " + str(#optIgnoreCaseFilenames), 1)
+    methodend
+
+
+    rem /**
+    rem  * The user checked or unchecked the option to ignore contents case when searching
+    rem  */
+    method protected void onCheckIgnoreCaseFileContents(BBjCheckChangeEvent p_event!)
+        #optIgnoreCaseContents = p_event!.isChecked()
+        #hashPrefs!.put(#optIgnoreCaseContentsKey!, str(#optIgnoreCaseContents))
+        #saveCookies()
+        #consoleLog("#optIgnoreCaseContents = " + str(#optIgnoreCaseContents), 1)
+    methodend
+
+
+    rem /**
+    rem  * The user checked or unchecked the option to use RegExs when searching for content
+    rem  */
+    method protected void onCheckRegEx(BBjCheckChangeEvent p_event!)
+        #optUseRegularExpressions = p_event!.isChecked()
+        #hashPrefs!.put(#optUseRegularExpressionsKey!, str(#optUseRegularExpressions))
+        #saveCookies()
+        #consoleLog("#optUseRegularExpressions = " + str(#optUseRegularExpressions), 1)
+    methodend
+
+
+    rem /**
+    rem  * The user checked or unchecked the option to recurse directories when searching for files
+    rem  */
+    method protected void onCheckRecursive(BBjCheckChangeEvent p_event!)
+        #optSearchRecursively = p_event!.isChecked()
+        #hashPrefs!.put(#optSearchRecursivelyKey!, str(#optSearchRecursively))
+        #saveCookies()
+        #consoleLog("#optSearchRecursively = " + str(#optSearchRecursively), 1)
+    methodend
+
+
+    rem /** Sets the file name pattern
+    rem  *
+    rem  * BBjString fileNamePattern!       The pattern to use to determine which files to report on
+    rem  */
+    method protected void setFileNamePattern(BBjString fileNamePattern!)
+        #optFileName! = fileNamePattern!
+        #mruFileNames!.put(#optFileName!, DemoUtils.getFileNameFromFullPath(#optFileName!))
+        #hashPrefs!.put(#optFileNameKey!,   #optFileName!)
+        #hashPrefs!.put(#optMruFilesKey!,   #getJsonFromMru(#mruFileNames!).toString())
+        #saveCookies()
+
+        rem See if we ought to reload the ListButton's list because the MRU may have changed
+        if (#lstFileName! <> null()) then
+
+            rem See if the ListButton's list differs from the MRU - remember to reverse the MRU's order, as it's in least-recently used order
+            vectListButton! = #lstFileName!.getAllItems()
+            vectMRU! = new java.util.Vector(#mruFileNames!.keySet())
+            java.util.Collections.reverse(vectMRU!)
+
+            rem Reload the contents based on the MRU, but only if the contents are different to avoid an unnecessary flash
+            if (vectListButton! <> vectMRU!) then
+                #lstFileName!.removeAllItems()
+                #lstFileName!.insertItems(0,#getMruForListButton(#mruFileNames!))
+                #lstFileName!.selectIndex(#lstFileName!.getAllItems().indexOf(#optFileName!))
+            endif
+
+        endif
+    methodend
+
+
+    rem ToDo    Could this be optimized by only setting the newly-added rows?
+    rem         IOW, we're currently resetting the entire contents of the grid which isn't efficient.
+    rem         Is it possible, if we're using the same vector of data, to figure out which section
+    rem         at the end of the vector isn't yet in the grid?  We could determine that by comparing
+    rem         the number of current rows in the grid and the new NumRows, then just set the newly
+    rem         added rows to what's in the vector.
+    rem /**
+    rem  * Update the results grid with information from the provided vector
+    rem  */
+    method protected void updateGridWithResults(BBjVector vectorData!)
+        #gridResults!.setNumRows(#getNumGridRowsFromVector(vectorData!))
+        #gridResults!.setCellText(vectorData!)
+        #gridResults!.scrollToBottom()
+    methodend
+
+    rem /**
+    rem  * Logs a string to the browser's Developer Tools console in DWC/BUI and the BBjServices Debug log in GUI if the global Debug flag is set
+    rem  *
+    rem  * @param BBjString logEntry!       The string to log to the console or debug file
+    rem  */
+    method protected void consoleLog(BBjString logEntry!)
+        if (#Debug) then
+            logEntry! = logEntry!.replaceAll("'", "\'")
+            #SysGui!.executeScript("console.log('%c" + #appName! + " Log:%c%s', 'background: hsl(60, 100%, 65%); color: hsl(350, 100%, 25%); padding: 2px 4px; border-radius: 3px; border: 1px solid hsl(350, 100%, 25%); font-weight: 700;', 'background: hsl(275, 90%, 95%); color: hsl(275, 35%, 35%); padding: 2px 4px; border-radius: 3px; border: 1px solid hsl(275, 35%, 35%);', `" + logEntry! + "`); ")
+        endif
+    methodend
+
+
+    rem /**
+    rem  * Logs a string to the browser's Developer Tools console in DWC/BUI and the BBjServices Debug log in GUI if the global Debug flag is set OR if the bypassDebugFlag parameter is TRUE
+    rem  *
+    rem  * @param BBjString logEntry!           The string to log to the console or debug file
+    rem  * @param BBjString css!                The CSS string used to style the log output.  This is usually a constant, such as FileFinder.getCssConsoleBlue(), FileFinder.getCssConsoleOrange(), or FileFinder.getCssConsoleRed()
+    rem  *
+    rem  */
+    method protected void consoleLog(BBjString logEntry!, BBjString css!)
+        if (#Debug) then
+            logEntry! = logEntry!.replaceAll("'", "\'")
+            #SysGui!.executeScript("console.log('%c" + #appName! + " Log:%c%s', 'background: hsl(60, 100%, 65%); color: hsl(350, 100%, 25%); padding: 2px 4px; border-radius: 3px; border: 1px solid hsl(350, 100%, 25%); font-weight: 700;'," +  css! + ", `" + logEntry! + "`); ")
+        endif
+    methodend
+
+
+    rem /**
+    rem  * Logs a string to the browser's Developer Tools console in DWC/BUI and the BBjServices Debug log in GUI if the global Debug flag is set OR if the bypassDebugFlag parameter is TRUE
+    rem  *
+    rem  * @param BBjString logEntry!           The string to log to the console or debug file
+    rem  * @param BBjNumber bypassDebugFlag     A BBjNumber acting as a boolean that indicates whether the logEntry! should logged regardless of the state of the global Debug flag. 1=Always log, 0=Only log if the global Debug flag is set.
+    rem  *
+    rem  */
+    method protected void consoleLog(BBjString logEntry!, BBjNumber bypassDebugFlag)
+        if ((#Debug) OR (bypassDebugFlag)) then
+            logEntry! = logEntry!.replaceAll("'", "\'")
+            #SysGui!.executeScript("console.log('%c" + #appName! + " Log:%c%s', 'background: hsl(60, 100%, 65%); color: hsl(350, 100%, 25%); padding: 2px 4px; border-radius: 3px; border: 1px solid hsl(350, 100%, 25%); font-weight: 700;', 'background: hsl(0, 100%, 95%); color: hsl(20, 75%, 25%); padding: 2px 4px; border-radius: 3px; border: 1px solid hsl(20, 75%, 25%); font-weight: 700;', `" + logEntry! + "`); ")
+        endif
+    methodend
+
+
+    rem /**
+    rem  * Logs a string to the browser's Developer Tools console in DWC/BUI and the BBjServices Debug log in GUI if the global Debug flag is set OR if the bypassDebugFlag parameter is TRUE
+    rem  *
+    rem  * @param BBjString logEntry!           The string to log to the console or debug file
+    rem  * @param BBjString css!                The CSS string used to style the log output.  This is usually a constant, such as FileFinder.getCssConsoleBlue(), FileFinder.getCssConsoleOrange(), or FileFinder.getCssConsoleRed()
+    rem  * @param BBjNumber bypassDebugFlag     A BBjNumber acting as a boolean that indicates whether the logEntry! should logged regardless of the state of the global Debug flag. 1=Always log, 0=Only log if the global Debug flag is set.
+    rem  *
+    rem  */
+    method protected void consoleLog(BBjString logEntry!, BBjString css!, BBjNumber bypassDebugFlag)
+        logEntry! = logEntry!.replaceAll("'", "\'")
+        if ((#Debug = 1) OR (bypassDebugFlag = 1)) then
+           #SysGui!.executeScript("console.log('%c" + #appName! + " Log:%c%s', 'background: hsl(60, 100%, 65%); color: hsl(350, 100%, 25%); padding: 2px 4px; border-radius: 3px; border: 1px solid hsl(350, 100%, 25%); font-weight: 700;'," +  css! + ", `" + logEntry! + "`); ")
+        endif
+    methodend
+
+
+    rem /**
+    rem  * Sets the specified DWC theme using a built-in constant, such as FileFinder.THEME_DARK(), FileFinder.THEME_LIGHT(), etc.
+    rem  *
+    rem  * @param BBjString theme!  A string that correlates to the desired theme to set ("light", "dark", "dark-pure", or "system" to use the system default theme).
+    rem  */
+    method public void setTheme(BBjString theme!)
+        if (theme! = null()) OR (theme! = "null") then methodret
+        #webManager!.setTheme(theme!)
+
+        rem Since we call this directly (as opposed to just as a result of the user's action)
+        rem we do a null() check since everything may not be setup yet.
+        if (#hashPrefs! <> null()) then
+            #hashPrefs!.put(#optThemeKey!, #optTheme!)
+            #saveCookies()
+        endif
+    methodend
+
+
+    rem /**
+    rem  * Saves all the cookies for the app via BBj's user prefrerences
+    rem  */
+    method protected void saveCookies()
+        DemoUtils.setCookies(#appName!, #hashPrefs!, err=*NEXT)
+    methodend
+
+
+    rem /**
+    rem  * Returns a JsonObject representation of a MRU (LinkedHashMap)
+    rem  * <p>
+    rem  * This is used to serialize a MRU so that it can be written out to a properties file or cookie as a string.
+    rem  */
+    method public static JsonObject getJsonFromMru(LinkedHashMap mru!)
+        declare auto JsonObject json!
+
+        json! = new JsonObject()
+        list! = new java.util.ArrayList(mru!.keySet())
+        it! = list!.iterator()
+        while it!.hasNext()
+            key! = it!.next()
+            value! = mru!.get(key!)
+            json!.addProperty(key!, value!)
+        wend
+        methodret json!
+    methodend
+
+
+    rem /**
+    rem  * Returns a string built from a MRU (LinkedHashMap) that can be used to populate a BBjListButton.
+    rem  *
+    rem  * When creating a BBjListbutton, you can optionally provide a string for the control's
+    rem  * initial contents.  This string consists of line feed separated strings containing the
+    rem  * initial contents of the list.
+    rem  *
+    rem  * When inserting items into a BBjListButton, you can provide the list of items either as
+    rem  * a BBjVector or a linefeed-delimited list of items to be added to the list.
+    rem  *
+    rem  * This method takes a MRU (Most Recently Used) LinkedHashMap and returns the list of keys
+    rem  * in reverse order in the required format.
+    rem  *
+    rem  * The reason that the method reverses the MRU's keys is that the MRU was created with
+    rem  * the constructor that takes an access order parameter.  When this parameter is TRUE
+    rem  * (as is the case for the MRUs in this app), the LinkedHashMap will be ordered in
+    rem  * access order instead of insertion order.  Access order means that the order of iteration
+    rem  * is the order in which its entries were last accessed, from least-recently accessed to
+    rem  * most-recently.  Therefore, the most recent/frequently used items will be at the bottom of
+    rem  * the list and the least frequently used items will be at the top of the list.  Because of
+    rem  * this, it makes sense to return the information in the reversed order so that the
+    rem  * BBjListButton will be loaded with the most recently/frequently used items first.
+    rem  *
+    rem  * @param LinkedHashMap mru!      The MRU (LinkedHashMap) from which the linefeed delimited string will be built.
+    rem  *
+    rem  * @return BBjString              A string consisting of line feed separated keys from the MRU
+    rem  */
+    method public BBjString getMruForListButton(LinkedHashMap mru!)
+        list! = new java.util.ArrayList(mru!.keySet())
+        java.util.Collections.reverse(list!)
+        methodret java.lang.String.join($0a$, list!)
+    methodend
+
+
+    rem /**
+    rem  * Returns a MRU (LinkedHashMap) from a BBjString representation of a JsonObject
+    rem  * <p>
+    rem  * This is used to deserialize a string into a MRU that had previously been
+    rem  * serialized to be written out to a properties file or cookie as a string.
+    rem  *
+    rem  * @param BBjString jsonString!     The string representation of the JsonObject to be converted into a MRU (LinkedHashMap)
+    rem  * @param BBjNumber maxEntries      The maximum number of entries that the MRU will contain.
+    rem  *
+    rem  * @return LinkedHashMap            The MRU (LinkedHashMap) that was created from the supplied string
+    rem  */
+    method public static LinkedHashMap getMruFromJsonString(BBjString jsonString!, BBjNumber maxEntries)
+        declare auto JsonObject json!
+        declare auto LinkedHashMap mru!
+
+        mru! = new LinkedHashMap(maxEntries, new Float(.75), Boolean.TRUE)
+        json! =  cast(JsonObject, new Gson().fromJson(jsonString!, com.google.gson.JsonObject.class))
+        it! = json!.asMap().keySet().iterator()
+        while it!.hasNext()
+            key! = str(it!.next())
+            value! = json!.get(key!).getAsString()
+            mru!.put(key!, value!)
+        wend
+        methodret mru!
+    methodend
+
+
+    rem /**
+    rem  * Exits the app, called when the user closes the main window
+    rem  */
+    method protected void onExit(BBjEvent p_event!)
+        #winOuter!.setVisible(0)
+        release
+    methodend
+
+
+classend
+
+
+
+rem ================================================================================================
+rem USE Statements
+rem ================================================================================================
+    rem BASIS and Java libraries
+    use ::DemoUtils.bbj::DemoUtils
+    use ::BBUtils.bbj::BBUtils
+
+    use java.util.regex.Pattern
+    use java.util.regex.Matcher
+    use java.util.Map
+    use java.util.HashMap
+    use java.util.TreeMap
+    use java.util.LinkedHashMap
+    use java.util.Collections
+    use java.util.ArrayList
+    use java.net.URLEncoder
+    use java.net.URLDecoder
+    use java.text.SimpleDateFormat
+    use java.util.Date
+    use java.lang.Float
+    use java.io.File
+    use java.nio.file.Files
+    use java.nio.file.Path
+    use java.nio.file.Paths
+    use java.nio.file.StandardCopyOption
+
+    rem Google Gson library
+    use com.google.gson.Gson
+    use com.google.gson.JsonObject
+
+    rem jsoup library classes
+    use org.jsoup.Jsoup
+    use org.jsoup.nodes.Document
+    use org.jsoup.nodes.Node
+    use org.jsoup.nodes.Element
+    use org.jsoup.nodes.Entities
+    use org.jsoup.nodes.Attribute
+    use org.jsoup.nodes.Attributes
+    use org.jsoup.nodes.Range
+    use org.jsoup.select.Elements
+    use org.jsoup.nodes.Range.Position
+    use org.jsoup.parser.Parser
+    use org.jsoup.parser.Tag
+    use org.jsoup.safety.Safelist
